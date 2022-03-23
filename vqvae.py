@@ -207,6 +207,12 @@ class VQVAE(nn.Module):
 
         return dec, diff
 
+    def inf(self, input):
+        quant_t, quant_b, diff, id_t, id_b = self.encode(input)
+        dec = self.decode(quant_t, quant_b)
+
+        return dec, id_t, id_b
+
     def encode(self, input):
         enc_b = self.enc_b(input)
         enc_t = self.enc_t(enc_b)
@@ -244,93 +250,7 @@ class VQVAE(nn.Module):
         return dec
 
 
-class WQuantize(nn.Module):
-    def __init__(self, dim, n_embed, decay=0.99, eps=1e-5):
-        super().__init__()
-
-        self.dim = dim
-        self.n_embed = n_embed
-        self.decay = decay
-        self.eps = eps
-
-        embed = torch.randn(dim, n_embed)
-        self.register_buffer("embed", embed)
-        self.register_buffer("cluster_size", torch.zeros(n_embed))
-        self.register_buffer("embed_avg", embed.clone())
-        
-
-
-    def forward(self, input, embed_data):
-        # input shape = [bs, w, h, c]
-        
-
-        # using word embedding finding code id
-
-        flatten = embed_data.reshape(-1, self.dim)
-        dist = (
-            flatten.pow(2).sum(1, keepdim=True)
-            - 2 * flatten @ self.embed
-            + self.embed.pow(2).sum(0, keepdim=True)
-        )
-        _, embed_ind = (-dist).max(1)
-
-        embed_onehot = F.one_hot(embed_ind, self.n_embed).type(flatten.dtype)
-        embed_ind = embed_ind.view(*input.shape[:-1])
-        quantize = self.embed_code(embed_ind)
-
-        # update code book using image embeding
-        if self.training:
-            flatten = input.reshape(-1, self.dim)
-            embed_onehot_sum = embed_onehot.sum(0)
-            embed_sum = flatten.transpose(0, 1) @ embed_onehot
-
-            dist_fn.all_reduce(embed_onehot_sum)
-            dist_fn.all_reduce(embed_sum)
-
-            self.cluster_size.data.mul_(self.decay).add_(
-                embed_onehot_sum, alpha=1 - self.decay
-            )
-            self.embed_avg.data.mul_(self.decay).add_(embed_sum, alpha=1 - self.decay)
-            n = self.cluster_size.sum()
-            cluster_size = (
-                (self.cluster_size + self.eps) / (n + self.n_embed * self.eps) * n
-            )
-            embed_normalized = self.embed_avg / cluster_size.unsqueeze(0)
-            self.embed.data.copy_(embed_normalized)
-
-        diff = (quantize.detach() - input).pow(2).mean()
-        quantize = input + (quantize - input).detach()
-
-        diff_embed = (quantize.detach() - embed_data).pow(2).mean()
-        #pdb.set_trace()
-
-        return quantize, diff + diff_embed, embed_ind
-
-    def embed_code(self, embed_id):
-        return F.embedding(embed_id, self.embed.transpose(0, 1))
-
-    def forward_label(self, label):
-        bs = label.shape[0]
-        embed_data = F.relu(self.embed_text(label.float())).view(bs,1,self.size, self.size)
-        embed_data = F.relu(self.embed_fc(embed_data))
-        embed_data = self.embed_same(embed_data).permute(0,2,3,1)
-
-        flatten = embed_data.reshape(-1, self.dim)
-        dist = (
-            flatten.pow(2).sum(1, keepdim=True)
-            - 2 * flatten @ self.embed
-            + self.embed.pow(2).sum(0, keepdim=True)
-        )
-        _, embed_ind = (-dist).max(1)
-
-        embed_ind = embed_ind.view(*embed_data.shape[:-1])
-        quantize = self.embed_code(embed_ind)
-
-        return quantize
-
-
-
-class WVQVAE(nn.Module):
+class CVQVAE(nn.Module):
     def __init__(
         self,
         in_channel=3,
@@ -340,19 +260,18 @@ class WVQVAE(nn.Module):
         embed_dim=64,
         n_embed=512,
         decay=0.99,
-        img_size = 256
     ):
         super().__init__()
 
-        self.enc_b = Encoder(in_channel, channel, n_res_block, n_res_channel, stride=4)
+        self.enc_b = Encoder(in_channel+1, channel, n_res_block, n_res_channel, stride=4)
         self.enc_t = Encoder(channel, channel, n_res_block, n_res_channel, stride=2)
         self.quantize_conv_t = nn.Conv2d(channel, embed_dim, 1)
-        self.quantize_t = WQuantize(embed_dim, n_embed)
+        self.quantize_t = Quantize(embed_dim, n_embed)
         self.dec_t = Decoder(
             embed_dim, embed_dim, channel, n_res_block, n_res_channel, stride=2
         )
         self.quantize_conv_b = nn.Conv2d(embed_dim + channel, embed_dim, 1)
-        self.quantize_b = WQuantize(embed_dim, n_embed)
+        self.quantize_b = Quantize(embed_dim, n_embed)
         self.upsample_t = nn.ConvTranspose2d(
             embed_dim, embed_dim, 4, stride=2, padding=1
         )
@@ -364,40 +283,32 @@ class WVQVAE(nn.Module):
             n_res_channel,
             stride=4,
         )
-        
-        self.embed_text = nn.Linear(512, img_size**2)
-        self.embed_conv = nn.Conv2d(1, 3, 3, stride=1, padding=1)
-        self.img_size = img_size
+        self.word_fc = nn.Linear(512, 256*256)
+        self.word_conv = nn.Conv2d(1,1,1, stride=1, padding=0)
 
-        self.enc_t_b = Encoder(in_channel, channel, n_res_block, n_res_channel, stride=4)
-        self.enc_t_t = Encoder(channel, channel, n_res_block, n_res_channel, stride=2)
-        self.quantize_conv_t_t = nn.Conv2d(channel, embed_dim, 1)
-        self.quantize_t_t = WQuantize(embed_dim, n_embed)
-        self.quantize_conv_t_b = nn.Conv2d(embed_dim + channel, embed_dim, 1)
-        self.quantize_t_b = WQuantize(embed_dim, n_embed)
-    
-
-    def forward(self, input, label):
-        bs = input.shape[0]
-        label = self.embed_text(label.flaot()).view(bs,1, self.img_size)
-        label = self.embed_conv(label)
-
-        quant_t, quant_b, diff, _, _ = self.encode(input, label)
+    def forward(self, input, word):
+        word = word.float()
+        bs ,size= input.shape[0], input.shape[2]
+        embed = self.word_fc(word).view(bs, 1, size, size)
+        embed = self.word_conv(embed)
+        input = torch.cat([input, embed], 1)
+        quant_t, quant_b, diff, _, _ = self.encode(input)
         dec = self.decode(quant_t, quant_b)
 
         return dec, diff
 
-    def encode(self, input, label):
-        enc_t_b = self.enc_t_b(label)
-        enc_t_t = self.enc_t_t(label)
-        quant_t_t = self.quantize_conv_t_t(enc_t_t).permute(0, 2, 3, 1)
-        quant_t_b = self.quantize_conv_t_b(enc_t_b).permute(0, 2, 3, 1)
+    def inf(self, input):
+        quant_t, quant_b, diff, id_t, id_b = self.encode(input)
+        dec = self.decode(quant_t, quant_b)
 
+        return dec, id_t, id_b
+
+    def encode(self, input):
         enc_b = self.enc_b(input)
         enc_t = self.enc_t(enc_b)
 
         quant_t = self.quantize_conv_t(enc_t).permute(0, 2, 3, 1)
-        quant_t, diff_t, id_t = self.quantize_t(quant_t, quant_t_t)
+        quant_t, diff_t, id_t = self.quantize_t(quant_t)
         quant_t = quant_t.permute(0, 3, 1, 2)
         diff_t = diff_t.unsqueeze(0)
 
@@ -405,7 +316,7 @@ class WVQVAE(nn.Module):
         enc_b = torch.cat([dec_t, enc_b], 1)
 
         quant_b = self.quantize_conv_b(enc_b).permute(0, 2, 3, 1)
-        quant_b, diff_b, id_b = self.quantize_b(quant_b, quant_t_b)
+        quant_b, diff_b, id_b = self.quantize_b(quant_b)
         quant_b = quant_b.permute(0, 3, 1, 2)
         diff_b = diff_b.unsqueeze(0)
 
@@ -422,17 +333,6 @@ class WVQVAE(nn.Module):
         quant_t = self.quantize_t.embed_code(code_t)
         quant_t = quant_t.permute(0, 3, 1, 2)
         quant_b = self.quantize_b.embed_code(code_b)
-        quant_b = quant_b.permute(0, 3, 1, 2)
-
-        dec = self.decode(quant_t, quant_b)
-
-        return dec
-    
-    def forward_label(self, label):
-        quant_t = self.quantize_t.forward_label(label)
-        quant_t = quant_t.permute(0, 3, 1, 2)
-
-        quant_b = self.quantize_b.forward_label(label)
         quant_b = quant_b.permute(0, 3, 1, 2)
 
         dec = self.decode(quant_t, quant_b)

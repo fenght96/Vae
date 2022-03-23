@@ -11,7 +11,7 @@ from torchvision import datasets, transforms, utils
 
 from tqdm import tqdm
 import pdb
-from vqvae import VQVAE, WVQVAE
+from vqvae import VQVAE, CVQVAE
 from scheduler import CycleScheduler
 import distributed as dist
 from PIL import Image
@@ -65,6 +65,7 @@ def train(epoch, loader, model, optimizer, scheduler, device):
 
         img = img.to(device)
         label = label.to(device)
+        
 
         out, latent_loss = model(img, label)
         recon_loss = criterion(out, img)
@@ -99,12 +100,12 @@ def train(epoch, loader, model, optimizer, scheduler, device):
             if i % 100 == 0:
                 model.eval()
 
-                sample = label[:sample_size]
                 sample_img = img[:sample_size]
+                sample_label = label[:sample_size]
 
                 with torch.no_grad():
-                    out, _ = model(sample_img, sample)
-                    out_sample = model.forward_label(sample)
+                    out, _ = model(sample_img, sample_label)
+                    
 
                 utils.save_image(
                     torch.cat([sample_img, out], 0),
@@ -113,13 +114,7 @@ def train(epoch, loader, model, optimizer, scheduler, device):
                     normalize=True,
                     range=(-1, 1),
                 )
-                utils.save_image(
-                    torch.cat([sample_img, out_sample], 0),
-                    f"sample/{str(epoch + 1).zfill(5)}_{str(i).zfill(5)}_label.png",
-                    nrow=sample_size,
-                    normalize=True,
-                    range=(-1, 1),
-                )
+
 
                 model.train()
 
@@ -140,10 +135,10 @@ def main(args):
     )
     sampler = dist.data_sampler(dataset, shuffle=True, distributed=args.distributed)
     loader = DataLoader(
-        dataset, batch_size=128 // args.n_gpu, sampler=sampler, num_workers=2
+        dataset, batch_size= 64 // args.n_gpu, sampler=sampler, num_workers=2
     )
 
-    model = WVQVAE().to(device)
+    model = CVQVAE().to(device)
 
 
     if args.distributed:

@@ -1,3 +1,6 @@
 *.pt
 sample/
 checkpoint/
+*.png
+*.npy
+*.pt
